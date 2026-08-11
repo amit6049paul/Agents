@@ -1,222 +1,193 @@
-from typing import Annotated
-from typing_extensions import TypedDict
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages
-from dotenv import load_dotenv
-from langgraph.prebuilt import ToolNode
-from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from typing import List, Any, Optional, Dict
-from pydantic import BaseModel, Field
-from sidekick_tools import playwright_tools, other_tools
+"""The Sidekick: a create_agent worker wrapped in a homemade evaluator loop.
+
+The worker is a single create_agent (Layer 3). Around it we run our own loop that checks
+the worker's answer against the user's success criteria, and either accepts it, sends it
+back for another attempt, or returns to the user with a question. Middleware gives the
+worker a plan it shares with the UI, guardrails for PII and runaway costs, and a pause
+for human approval before sensitive actions.
+"""
+
+import os
 import uuid
-import asyncio
 from datetime import datetime
+
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from langchain_openai import ChatOpenAI
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    HumanInTheLoopMiddleware,
+    ModelCallLimitMiddleware,
+    PIIMiddleware,
+    TodoListMiddleware,
+)
+from langchain_core.messages import ToolMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+from sidekick_tools import get_all_tools
 
 load_dotenv(override=True)
 
-
-class State(TypedDict):
-    messages: Annotated[List[Any], add_messages]
-    success_criteria: str
-    feedback_on_work: Optional[str]
-    success_criteria_met: bool
-    user_input_needed: bool
+HERE = os.path.dirname(os.path.abspath(__file__))
+SANDBOX = os.path.join(HERE, "sandbox")
+MAX_ATTEMPTS = 3
 
 
 class EvaluatorOutput(BaseModel):
     feedback: str = Field(description="Feedback on the assistant's response")
     success_criteria_met: bool = Field(description="Whether the success criteria have been met")
     user_input_needed: bool = Field(
-        description="True if more input is needed from the user, or clarifications, or the assistant is stuck"
+        description="True if the assistant has a question, needs clarification, or is stuck and needs the user"
     )
+
+
+WORKER_PROMPT = """You are Sidekick, a capable personal assistant who completes tasks for the user.
+You have a real web browser, a sandbox filesystem, web search, Wikipedia, and the ability to send push notifications.
+When you use the browser, navigate to a page and read it with a snapshot rather than clicking around unnecessarily.
+Dismiss cookie banners and popups yourself by clicking in the browser. If you reach something only a human can do,
+like logging in, a captcha, or two-factor authentication, use the request_human_help tool to tell the user exactly
+what to do in your browser window, then carry on once they have done it.
+For flight searches, use Google Flights in your browser: go straight to https://www.google.com/travel/flights?q=...
+with a natural language query like "flights from New York to London leaving 14 July returning 21 July".
+Keep working on the task until the success criteria are met, or until you genuinely need to ask the user a question.
+If you have a question, ask it plainly. When you are finished, give your final answer clearly,
+saying what you did, what you produced, and what you found."""
+
+
+class TolerateToolErrors(AgentMiddleware):
+    """Hand tool failures back to the model as a message so it can recover, rather than
+    crashing the run. Tools that touch the outside world, like a browser, fail now and then."""
+
+    async def awrap_tool_call(self, request, handler):
+        try:
+            return await handler(request)
+        except Exception as error:
+            return ToolMessage(
+                content=f"That tool call failed: {error}. Try another approach.",
+                tool_call_id=request.tool_call["id"],
+            )
 
 
 class Sidekick:
     def __init__(self):
-        self.worker_llm_with_tools = None
-        self.evaluator_llm_with_output = None
-        self.tools = None
-        self.llm_with_tools = None
-        self.graph = None
         self.sidekick_id = str(uuid.uuid4())
-        self.memory = MemorySaver()
-        self.browser = None
-        self.playwright = None
+        self.memory = InMemorySaver()
+        self.tools = None
+        self.sessions = None
+        self.worker = None
+        self.evaluator = None
+        self.task = ""
+        self.success_criteria = ""
+        self.attempts = 0
+        self.paused = False
+        self.pending_actions = 0
+        self.todos = []
 
     async def setup(self):
-        self.tools, self.browser, self.playwright = await playwright_tools()
-        self.tools += await other_tools()
-        worker_llm = ChatOpenAI(model="gpt-4o-mini")
-        self.worker_llm_with_tools = worker_llm.bind_tools(self.tools)
-        evaluator_llm = ChatOpenAI(model="gpt-4o-mini")
-        self.evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
-        await self.build_graph()
+        os.makedirs(SANDBOX, exist_ok=True)
+        self.tools, self.sessions = await get_all_tools(SANDBOX)
+        self.worker = create_agent(
+            model="openai:gpt-5.4-mini",
+            tools=self.tools,
+            system_prompt=f"{WORKER_PROMPT}\nToday is {datetime.now():%A %d %B %Y}.",
+            middleware=[
+                TolerateToolErrors(),
+                TodoListMiddleware(),
+                PIIMiddleware("email"),
+                PIIMiddleware("credit_card", apply_to_tool_results=True),
+                ModelCallLimitMiddleware(run_limit=30),
+                HumanInTheLoopMiddleware(
+                    interrupt_on={"send_push_notification": True, "request_human_help": True}
+                ),
+            ],
+            checkpointer=self.memory,
+        )
+        self.evaluator = ChatOpenAI(model="gpt-5.4-mini").with_structured_output(EvaluatorOutput)
 
-    def worker(self, state: State) -> Dict[str, Any]:
-        system_message = f"""You are a helpful assistant that can use tools to complete tasks.
-    You keep working on a task until either you have a question or clarification for the user, or the success criteria is met.
-    You have many tools to help you, including tools to browse the internet, navigating and retrieving web pages.
-    You have a tool to run python code, but note that you would need to include a print() statement if you wanted to receive output.
-    The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    async def evaluate(
+        self, message: str, success_criteria: str, last_reply: str, tools_used: list[str]
+    ) -> EvaluatorOutput:
+        prompt = f"""You decide whether an assistant has met the success criteria for a task.
 
-    This is the success criteria:
-    {state["success_criteria"]}
-    You should reply either with a question for the user about this assignment, or with your final response.
-    If you have a question for the user, you need to reply by clearly stating your question. An example might be:
+The user's request was:
+{message}
 
-    Question: please clarify whether you want a summary or a detailed answer
+The success criteria are:
+{success_criteria}
 
-    If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
-    """
+The tools the assistant called while working, in order:
+{", ".join(tools_used) or "none"}
 
-        if state.get("feedback_on_work"):
-            system_message += f"""
-    Previously you thought you completed the assignment, but your reply was rejected because the success criteria was not met.
-    Here is the feedback on why this was rejected:
-    {state["feedback_on_work"]}
-    With this feedback, please continue the assignment, ensuring that you meet the success criteria or have a question for the user."""
+The assistant's most recent reply was:
+{last_reply}
 
-        # Add in the system message
+Decide whether the success criteria are met, using the tool calls as evidence of what was actually done.
+Also decide whether the assistant needs more input from the user, either because it asked a question,
+needs clarification, or seems stuck. Give brief, concrete feedback."""
+        return await self.evaluator.ainvoke(prompt)
 
-        found_system_message = False
-        messages = state["messages"]
-        for message in messages:
-            if isinstance(message, SystemMessage):
-                message.content = system_message
-                found_system_message = True
-
-        if not found_system_message:
-            messages = [SystemMessage(content=system_message)] + messages
-
-        # Invoke the LLM with tools
-        response = self.worker_llm_with_tools.invoke(messages)
-
-        # Return updated state
-        return {
-            "messages": [response],
-        }
-
-    def worker_router(self, state: State) -> str:
-        last_message = state["messages"][-1]
-
-        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-            return "tools"
-        else:
-            return "evaluator"
-
-    def format_conversation(self, messages: List[Any]) -> str:
-        conversation = "Conversation history:\n\n"
-        for message in messages:
-            if isinstance(message, HumanMessage):
-                conversation += f"User: {message.content}\n"
-            elif isinstance(message, AIMessage):
-                text = message.content or "[Tools use]"
-                conversation += f"Assistant: {text}\n"
-        return conversation
-
-    def evaluator(self, state: State) -> State:
-        last_response = state["messages"][-1].content
-
-        system_message = """You are an evaluator that determines if a task has been completed successfully by an Assistant.
-    Assess the Assistant's last response based on the given criteria. Respond with your feedback, and with your decision on whether the success criteria has been met,
-    and whether more input is needed from the user."""
-
-        user_message = f"""You are evaluating a conversation between the User and Assistant. You decide what action to take based on the last response from the Assistant.
-
-    The entire conversation with the assistant, with the user's original request and all replies, is:
-    {self.format_conversation(state["messages"])}
-
-    The success criteria for this assignment is:
-    {state["success_criteria"]}
-
-    And the final response from the Assistant that you are evaluating is:
-    {last_response}
-
-    Respond with your feedback, and decide if the success criteria is met by this response.
-    Also, decide if more user input is required, either because the assistant has a question, needs clarification, or seems to be stuck and unable to answer without help.
-
-    The Assistant has access to a tool to write files. If the Assistant says they have written a file, then you can assume they have done so.
-    Overall you should give the Assistant the benefit of the doubt if they say they've done something. But you should reject if you feel that more work should go into this.
-
-    """
-        if state["feedback_on_work"]:
-            user_message += f"Also, note that in a prior attempt from the Assistant, you provided this feedback: {state['feedback_on_work']}\n"
-            user_message += "If you're seeing the Assistant repeating the same mistakes, then consider responding that user input is required."
-
-        evaluator_messages = [
-            SystemMessage(content=system_message),
-            HumanMessage(content=user_message),
-        ]
-
-        eval_result = self.evaluator_llm_with_output.invoke(evaluator_messages)
-        new_state = {
+    async def run_turn(self, message: str, success_criteria: str, history: list) -> list:
+        """One turn of conversation: the worker attempts the task and the evaluator checks it,
+        retrying with feedback up to MAX_ATTEMPTS. If the worker pauses for approval, this
+        returns straight away with paused set, and resume() continues the same turn."""
+        self.task = message
+        self.success_criteria = success_criteria or "The answer should be clear, correct and complete"
+        self.attempts = 0
+        self.todos = []
+        payload = {
             "messages": [
                 {
-                    "role": "assistant",
-                    "content": f"Evaluator Feedback on this answer: {eval_result.feedback}",
+                    "role": "user",
+                    "content": f"{message}\n\nThe success criteria for this task are: {self.success_criteria}",
                 }
-            ],
-            "feedback_on_work": eval_result.feedback,
-            "success_criteria_met": eval_result.success_criteria_met,
-            "user_input_needed": eval_result.user_input_needed,
+            ]
         }
-        return new_state
+        return await self._advance(payload, history + [{"role": "user", "content": message}])
 
-    def route_based_on_evaluation(self, state: State) -> str:
-        if state["success_criteria_met"] or state["user_input_needed"]:
-            return "END"
-        else:
-            return "worker"
+    async def resume(self, history: list) -> list:
+        """Approve the actions the worker paused on, and continue the turn."""
+        payload = Command(resume={"decisions": [{"type": "approve"}] * self.pending_actions})
+        return await self._advance(payload, history)
 
-    async def build_graph(self):
-        # Set up Graph Builder with State
-        graph_builder = StateGraph(State)
-
-        # Add nodes
-        graph_builder.add_node("worker", self.worker)
-        graph_builder.add_node("tools", ToolNode(tools=self.tools))
-        graph_builder.add_node("evaluator", self.evaluator)
-
-        # Add edges
-        graph_builder.add_conditional_edges(
-            "worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"}
-        )
-        graph_builder.add_edge("tools", "worker")
-        graph_builder.add_conditional_edges(
-            "evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END}
-        )
-        graph_builder.add_edge(START, "worker")
-
-        # Compile the graph
-        self.graph = graph_builder.compile(checkpointer=self.memory)
-
-    async def run_superstep(self, message, success_criteria, history):
+    async def _advance(self, payload, history: list) -> list:
         config = {"configurable": {"thread_id": self.sidekick_id}}
+        while True:
+            result = None
+            async for result in self.worker.astream(payload, config=config, stream_mode="values"):
+                self.todos = result.get("todos", self.todos)
 
-        state = {
-            "messages": message,
-            "success_criteria": success_criteria or "The answer should be clear and accurate",
-            "feedback_on_work": None,
-            "success_criteria_met": False,
-            "user_input_needed": False,
-        }
-        result = await self.graph.ainvoke(state, config=config)
-        user = {"role": "user", "content": message}
-        reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+            if "__interrupt__" in result:
+                actions = result["__interrupt__"][0].value["action_requests"]
+                self.paused = True
+                self.pending_actions = len(actions)
+                described = "\n".join(action["description"] for action in actions)
+                return history + [{"role": "assistant", "content": f"Waiting for your approval:\n{described}"}]
+
+            self.paused = False
+            reply = result["messages"][-1].content
+            tools_used = [
+                call["name"] for m in result["messages"] for call in (getattr(m, "tool_calls", None) or [])
+            ]
+            self.attempts += 1
+            verdict = await self.evaluate(self.task, self.success_criteria, reply, tools_used)
+            if verdict.success_criteria_met or verdict.user_input_needed or self.attempts >= MAX_ATTEMPTS:
+                return history + [
+                    {"role": "assistant", "content": reply},
+                    {"role": "assistant", "content": f"Evaluator: {verdict.feedback}"},
+                ]
+            payload = {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": f"Your last response did not meet the success criteria. "
+                        f"Here is the feedback: {verdict.feedback}. Please keep working and address it.",
+                    }
+                ]
+            }
 
     def cleanup(self):
-        if self.browser:
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.browser.close())
-                if self.playwright:
-                    loop.create_task(self.playwright.stop())
-            except RuntimeError:
-                # If no loop is running, do a direct run
-                asyncio.run(self.browser.close())
-                if self.playwright:
-                    asyncio.run(self.playwright.stop())
+        """Shut down the MCP servers; the browser window closes."""
+        if self.sessions:
+            self.sessions.stop()
